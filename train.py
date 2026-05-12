@@ -46,8 +46,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_source_chars", type=int, default=128)
     parser.add_argument("--min_target_words", type=int, default=2)
     parser.add_argument("--max_target_words", type=int, default=160)
-    parser.add_argument("--max_train_samples", type=int, default=200000)
-    parser.add_argument("--max_eval_samples", type=int, default=5000)
     parser.add_argument("--validation_split_ratio", type=float, default=0.01)
     parser.add_argument("--num_train_epochs", type=float, default=2.0)
     parser.add_argument("--learning_rate", type=float, default=2e-4)
@@ -89,8 +87,6 @@ def set_seed(seed: int) -> None:
 
 def resolve_runtime_flags(args: argparse.Namespace) -> None:
     if args.smoke_test:
-        args.max_train_samples = min(args.max_train_samples, 1000)
-        args.max_eval_samples = min(args.max_eval_samples, 200)
         args.num_train_epochs = min(args.num_train_epochs, 1.0)
         args.logging_steps = min(args.logging_steps, 10)
         args.d_model = min(args.d_model, 64)
@@ -156,10 +152,11 @@ class SimpleDataset:
     def select(self, indices: range) -> "SimpleDataset":
         return SimpleDataset([self.rows[idx] for idx in indices])
 
-    def train_test_split(self, test_size: float, seed: int) -> dict[str, "SimpleDataset"]:
-        rows = self.shuffle(seed).rows
-        test_count = max(1, int(len(rows) * test_size))
-        return {"train": SimpleDataset(rows[test_count:]), "test": SimpleDataset(rows[:test_count])}
+    def train_test_split(self, test_size: float, seed: int | None = None) -> dict[str, "SimpleDataset"]:
+        del seed
+        test_count = max(1, int(len(self.rows) * test_size))
+        train_count = max(0, len(self.rows) - test_count)
+        return {"train": SimpleDataset(self.rows[:train_count]), "test": SimpleDataset(self.rows[train_count:])}
 
 
 class NoamScheduler:
@@ -269,17 +266,11 @@ def filter_and_clean_dataset(dataset: SimpleDataset, fields: DatasetFields, args
     return cleaned
 
 
-def take_subset(dataset: SimpleDataset, limit: int, seed: int) -> SimpleDataset:
-    if limit <= 0 or len(dataset) <= limit:
-        return dataset
-    return dataset.shuffle(seed=seed).select(range(limit))
-
-
 def ensure_eval_split(train_dataset: SimpleDataset, eval_dataset: SimpleDataset | None, args: argparse.Namespace) -> tuple[SimpleDataset, SimpleDataset]:
     if eval_dataset is not None:
         return train_dataset, eval_dataset
-    split = train_dataset.train_test_split(test_size=args.validation_split_ratio, seed=args.seed)
-    print("No validation split found. Created one from train with ratio", args.validation_split_ratio)
+    split = train_dataset.train_test_split(test_size=args.validation_split_ratio)
+    print("No validation split found. Created one from train tail with ratio", args.validation_split_ratio)
     return split["train"], split["test"]
 
 
@@ -484,8 +475,6 @@ def main() -> None:
     if eval_raw is not None:
         eval_raw = filter_and_clean_dataset(eval_raw, fields, args, "eval")
     train_raw, eval_raw = ensure_eval_split(train_raw, eval_raw, args)
-    train_raw = take_subset(train_raw, args.max_train_samples, args.seed)
-    eval_raw = take_subset(eval_raw, args.max_eval_samples, args.seed)
     preview_samples(train_raw, fields)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -493,13 +482,15 @@ def main() -> None:
     train_dataset = TranslationDataset(train_raw, tokenizer, fields.source, fields.target, args.max_source_length, args.max_target_length)
     eval_dataset = TranslationDataset(eval_raw, tokenizer, fields.source, fields.target, args.max_source_length, args.max_target_length)
     collator = build_translation_collator(tokenizer)
-    train_loader = DataLoader(train_dataset, batch_size=args.per_device_train_batch_size, shuffle=True, collate_fn=collator)
+    train_loader = DataLoader(train_dataset, batch_size=args.per_device_train_batch_size, shuffle=False, collate_fn=collator)
     eval_loader = DataLoader(eval_dataset, batch_size=args.per_device_eval_batch_size, shuffle=False, collate_fn=collator)
+    print(f"Train dataloader: {len(train_dataset)} samples, {len(train_loader)} batches per epoch, shuffle=False")
+    print(f"Eval dataloader: {len(eval_dataset)} samples, {len(eval_loader)} batches, shuffle=False")
 
     config = TransformerConfig(src_vocab_size=len(tokenizer.src_vocab), tgt_vocab_size=len(tokenizer.tgt_vocab), src_pad_id=tokenizer.src_pad_id, tgt_pad_id=tokenizer.tgt_pad_id, d_model=args.d_model, num_heads=args.num_heads, num_encoder_layers=args.num_encoder_layers, num_decoder_layers=args.num_decoder_layers, d_ff=args.d_ff, dropout=args.dropout, max_position_embeddings=max(args.max_source_length, args.max_target_length) + 8)
     model = TransformerSeq2Seq(config).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, betas=(0.9, 0.98), eps=1e-9, weight_decay=args.weight_decay)
-    scheduler = NoamScheduler(optimizer, config.d_model, args.warmup_steps, args.noam_factor) if args.use_noam else None
+    scheduler = NoamScheduler(optimizer, config.d_model, args.warmup_steps, args.noam_factor)
     start_epoch = load_checkpoint(args.resume_from_checkpoint, model, optimizer, scheduler, device) if args.resume_from_checkpoint else 1
 
     history: list[dict[str, float]] = []
@@ -508,7 +499,11 @@ def main() -> None:
     for epoch in range(start_epoch, total_epochs + 1):
         print(f"Epoch {epoch}/{total_epochs}")
         train_metrics = train_one_epoch(model, train_loader, optimizer, device, scheduler, args.grad_clip, args.logging_steps, run=run)
-        eval_metrics = evaluate_loss(model, eval_loader, device, run=run, epoch=epoch) if args.do_eval else {"loss": 0.0, "ppl": 0.0}
+        if args.do_eval:
+            print(f"Running validation after epoch {epoch} on the full eval split.")
+            eval_metrics = evaluate_loss(model, eval_loader, device, run=run, epoch=epoch)
+        else:
+            eval_metrics = {"loss": 0.0, "ppl": 0.0}
         metrics = {"epoch": float(epoch), "train_loss": train_metrics["loss"], "train_ppl": train_metrics["ppl"], "eval_loss": eval_metrics["loss"], "eval_ppl": eval_metrics["ppl"]}
         print(json.dumps(metrics, ensure_ascii=False, indent=2))
         log_swanlab(run, {"train/epoch_loss": train_metrics["loss"], "train/epoch_ppl": train_metrics["ppl"], "eval/epoch_loss": eval_metrics["loss"], "eval/epoch_ppl": eval_metrics["ppl"]}, step=epoch)
