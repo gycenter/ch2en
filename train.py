@@ -70,7 +70,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--d_ff", type=int, default=1024)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--use_noam", action="store_true")
+    parser.add_argument("--use_noam", action="store_true", default=True)
+    parser.add_argument("--no_use_noam", action="store_false", dest="use_noam")
     parser.add_argument("--warmup_steps", type=int, default=4000)
     parser.add_argument("--noam_factor", type=float, default=1.0)
     parser.add_argument("--swanlab_project", default="zh-en-transformer")
@@ -315,9 +316,8 @@ def train_one_epoch(model: TransformerSeq2Seq, dataloader: DataLoader, optimizer
         optimizer.step()
         total_loss += float(loss.item())
         if log_every > 0 and step % log_every == 0:
-            avg_loss = total_loss / step
-            print(f"step={step} train_loss={avg_loss:.4f} lr={last_lr:.6g}")
-            log_swanlab(run, {"train/loss": avg_loss, "train/lr": last_lr, "train/step": float(step)})
+            print(f"step={step} train_loss={loss.item():.4f} lr={last_lr:.6g}")
+            log_swanlab(run, {"train/loss": float(loss.item()), "train/lr": last_lr, "train/step": float(step)})
     avg_loss = total_loss / max(1, len(dataloader))
     return {"loss": avg_loss, "ppl": math.exp(min(avg_loss, 20.0)), "lr": last_lr}
 
