@@ -232,12 +232,16 @@ class ZhEnTokenizer:
         add_eos: bool = False,
     ) -> list[int]:
         ids = self.tgt_vocab.encode_tokens(tokenize_en(text))
+
+        if max_length is not None:
+            special_token_count = int(add_bos) + int(add_eos)
+            max_content_length = max(0, max_length - special_token_count)
+            ids = ids[:max_content_length]
+
         if add_bos:
             ids = [self.tgt_vocab.bos_id] + ids
         if add_eos:
             ids = ids + [self.tgt_vocab.eos_id]
-        if max_length is not None:
-            ids = ids[:max_length]
         return ids
 
     """

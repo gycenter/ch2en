@@ -293,6 +293,8 @@ def compute_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
 def train_one_epoch(model: TransformerSeq2Seq, dataloader: DataLoader, optimizer: torch.optim.Optimizer, device: torch.device, scheduler: NoamScheduler | None, grad_clip: float, log_every: int, run: Any | None = None) -> dict[str, float]:
     model.train()
     total_loss = 0.0
+    recent_loss = 0.0
+    recent_steps = 0
     last_lr = optimizer.param_groups[0]["lr"]
     for step, batch in enumerate(dataloader, start=1):
         batch = move_batch_to_device(batch, device)
@@ -305,10 +307,16 @@ def train_one_epoch(model: TransformerSeq2Seq, dataloader: DataLoader, optimizer
         if scheduler is not None:
             last_lr = scheduler.step()
         optimizer.step()
-        total_loss += float(loss.item())
+        loss_value = float(loss.item())
+        total_loss += loss_value
+        recent_loss += loss_value
+        recent_steps += 1
         if log_every > 0 and step % log_every == 0:
-            print(f"step={step} train_loss={loss.item():.4f} lr={last_lr:.6g}")
-            log_swanlab(run, {"train/loss": float(loss.item()), "train/lr": last_lr, "train/step": float(step)})
+            recent_avg_loss = recent_loss / max(1, recent_steps)
+            print(f"step={step} train_loss_avg_last_{recent_steps}_steps={recent_avg_loss:.4f} lr={last_lr:.6g}")
+            log_swanlab(run, {"train/loss_avg_recent": recent_avg_loss, "train/lr": last_lr, "train/step": float(step)})
+            recent_loss = 0.0
+            recent_steps = 0
     avg_loss = total_loss / max(1, len(dataloader))
     return {"loss": avg_loss, "ppl": math.exp(min(avg_loss, 20.0)), "lr": last_lr}
 
