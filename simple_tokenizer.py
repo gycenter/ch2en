@@ -9,7 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-import jieba
+from tokenizers import Tokenizer
+from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+from tokenizers.models import BPE
+from tokenizers.pre_tokenizers import ByteLevel
+from tokenizers.trainers import BpeTrainer
 
 
 PAD_TOKEN = "<pad>" #padding
@@ -19,30 +23,26 @@ EOS_TOKEN = "<eos>" #end of sequence
 SPECIAL_TOKENS = [PAD_TOKEN, UNK_TOKEN, BOS_TOKEN, EOS_TOKEN]
 
 """
-正则表达式
-[A-Za-z]+(?:'[A-Za-z]+)?  英文单词（带'的单词）
-\d+(?:\.\d+)?  数字
-[^\w\s]  非单词和空格的符号
-"""
-_EN_TOKEN_PATTERN = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?|\d+(?:\.\d+)?|[^\w\s]", re.UNICODE)
-
-"""
-中文分词
+中英文 BPE tokenizer
 input:str
 output:list[str]
 """
-def tokenize_zh(text: str) -> list[str]:
-    return [token.strip() for token in jieba.lcut(text.strip()) if token.strip()]
-    #token.strip() 去除首尾空格/空字符串为False
-    #jieba.lcut()list cut分词保存为列表形式
+def create_bpe_tokenizer() -> Tokenizer:
+    tokenizer = Tokenizer(BPE(unk_token=UNK_TOKEN))
+    tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=True)
+    tokenizer.decoder = ByteLevelDecoder()
+    return tokenizer
 
-"""
-英文分词
-input:str
-output:list[str]
-"""
-def tokenize_en(text: str) -> list[str]:
-    return _EN_TOKEN_PATTERN.findall(text.lower().strip())
+
+def train_bpe_tokenizer(texts: Iterable[str], vocab_size: int, min_freq: int, lowercase: bool = False) -> Tokenizer:
+    tokenizer = create_bpe_tokenizer()
+    trainer = BpeTrainer(vocab_size=vocab_size, min_frequency=min_freq, special_tokens=SPECIAL_TOKENS)
+    if lowercase:
+        iterator = (str(text).lower().strip() for text in texts)
+    else:
+        iterator = (str(text).strip() for text in texts)
+    tokenizer.train_from_iterator(iterator, trainer=trainer)
+    return tokenizer
 
 """
 token -> id : encode_tokens
@@ -180,6 +180,8 @@ save/load词表
 class ZhEnTokenizer:
     src_vocab: Vocab
     tgt_vocab: Vocab
+    src_bpe_tokenizer: Tokenizer | None = None
+    tgt_bpe_tokenizer: Tokenizer | None = None
 
     """
     中/英文词表特殊tokenID
@@ -209,7 +211,10 @@ class ZhEnTokenizer:
         list[int]
     """
     def encode_src(self, text: str, max_length: int | None = None) -> list[int]:
-        ids = self.src_vocab.encode_tokens(tokenize_zh(text))
+        if self.src_bpe_tokenizer is not None:
+            ids = self.src_bpe_tokenizer.encode(str(text).strip()).ids
+        else:
+            ids = self.src_vocab.encode_tokens(str(text).strip())
         if max_length is not None:  #如果设置了最大长度就截断，默认值None就不截断
             ids = ids[:max_length]
         return ids
@@ -231,7 +236,10 @@ class ZhEnTokenizer:
         add_bos: bool = False,
         add_eos: bool = False,
     ) -> list[int]:
-        ids = self.tgt_vocab.encode_tokens(tokenize_en(text))
+        if self.tgt_bpe_tokenizer is not None:
+            ids = self.tgt_bpe_tokenizer.encode(str(text).lower().strip()).ids
+        else:
+            ids = self.tgt_vocab.encode_tokens(str(text).lower().strip().split())
 
         if max_length is not None:
             special_token_count = int(add_bos) + int(add_eos)
@@ -248,13 +256,25 @@ class ZhEnTokenizer:
     中文ids -> tokens -> 文本
     """
     def decode_src(self, ids: Iterable[int], skip_special_tokens: bool = True) -> str:
-        return " ".join(self.src_vocab.decode_ids(ids, skip_special_tokens=skip_special_tokens))
+        token_ids = [int(idx) for idx in ids]
+        if skip_special_tokens:
+            special_ids = {self.src_pad_id, self.src_vocab.unk_id, self.src_vocab.bos_id, self.src_vocab.eos_id}
+            token_ids = [idx for idx in token_ids if idx not in special_ids]
+        if self.src_bpe_tokenizer is not None:
+            return self.src_bpe_tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens).strip()
+        return " ".join(self.src_vocab.decode_ids(token_ids, skip_special_tokens=skip_special_tokens))
 
     """
     英文ids -> tokens -> 文本
     """
     def decode_tgt(self, ids: Iterable[int], skip_special_tokens: bool = True) -> str:
-        tokens = self.tgt_vocab.decode_ids(ids, skip_special_tokens=skip_special_tokens)
+        token_ids = [int(idx) for idx in ids]
+        if skip_special_tokens:
+            special_ids = {self.tgt_pad_id, self.tgt_vocab.unk_id, self.tgt_bos_id, self.tgt_eos_id}
+            token_ids = [idx for idx in token_ids if idx not in special_ids]
+        if self.tgt_bpe_tokenizer is not None:
+            return self.tgt_bpe_tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens).strip()
+        tokens = self.tgt_vocab.decode_ids(token_ids, skip_special_tokens=skip_special_tokens)
         return detokenize_en(tokens)
 
     """
@@ -272,12 +292,18 @@ class ZhEnTokenizer:
         payload = {
             "src_vocab": self.src_vocab.to_dict(),
             "tgt_vocab": self.tgt_vocab.to_dict(),
+            "source_tokenizer_type": "bpe" if self.src_bpe_tokenizer is not None else "word",
+            "target_tokenizer_type": "bpe" if self.tgt_bpe_tokenizer is not None else "word",
         }
         (path / "tokenizer.json").write_text(
             #把 payload 字典转换成 JSON 字符串
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        if self.src_bpe_tokenizer is not None:
+            self.src_bpe_tokenizer.save(str(path / "source_bpe_tokenizer.json"))
+        if self.tgt_bpe_tokenizer is not None:
+            self.tgt_bpe_tokenizer.save(str(path / "target_bpe_tokenizer.json"))
 
     """
     加载词表--从文件夹里的 tokenizer.json 文件中加载词表
@@ -291,10 +317,16 @@ class ZhEnTokenizer:
         path = Path(directory) / "tokenizer.json"
         #把 JSON 字符串转换成 Python 字典
         payload = json.loads(path.read_text(encoding="utf-8"))
+        src_bpe_path = Path(directory) / "source_bpe_tokenizer.json"
+        tgt_bpe_path = Path(directory) / "target_bpe_tokenizer.json"
+        src_bpe_tokenizer = Tokenizer.from_file(str(src_bpe_path)) if src_bpe_path.exists() else None
+        tgt_bpe_tokenizer = Tokenizer.from_file(str(tgt_bpe_path)) if tgt_bpe_path.exists() else None
         #创建 ZhEnTokenizer 对象，传入 src_vocab 和 tgt_vocab
         return cls(
             src_vocab=Vocab.from_dict(payload["src_vocab"]),
             tgt_vocab=Vocab.from_dict(payload["tgt_vocab"]),
+            src_bpe_tokenizer=src_bpe_tokenizer,
+            tgt_bpe_tokenizer=tgt_bpe_tokenizer,
         )
 
     """
@@ -315,11 +347,15 @@ class ZhEnTokenizer:
         max_tgt_vocab_size: int = 30000,
         min_freq: int = 2,
     ) -> "ZhEnTokenizer":
-        source_tokenized = [tokenize_zh(text) for text in source_texts]
-        target_tokenized = [tokenize_en(text) for text in target_texts]
+        source_text_list = [str(text) for text in source_texts]
+        target_text_list = [str(text) for text in target_texts]
+        src_bpe_tokenizer = train_bpe_tokenizer(source_text_list, max_src_vocab_size, min_freq, lowercase=False)
+        tgt_bpe_tokenizer = train_bpe_tokenizer(target_text_list, max_tgt_vocab_size, min_freq, lowercase=True)
         return cls(
-            src_vocab=Vocab.build(source_tokenized, max_src_vocab_size, min_freq=min_freq),
-            tgt_vocab=Vocab.build(target_tokenized, max_tgt_vocab_size, min_freq=min_freq),
+            src_vocab=Vocab.from_dict(src_bpe_tokenizer.get_vocab()),
+            tgt_vocab=Vocab.from_dict(tgt_bpe_tokenizer.get_vocab()),
+            src_bpe_tokenizer=src_bpe_tokenizer,
+            tgt_bpe_tokenizer=tgt_bpe_tokenizer,
         )
 
 

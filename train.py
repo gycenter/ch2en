@@ -290,13 +290,14 @@ def compute_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     return nn.functional.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1), ignore_index=-100)
 
 
-def train_one_epoch(model: TransformerSeq2Seq, dataloader: DataLoader, optimizer: torch.optim.Optimizer, device: torch.device, scheduler: NoamScheduler | None, grad_clip: float, log_every: int, run: Any | None = None) -> dict[str, float]:
+def train_one_epoch(model: TransformerSeq2Seq, dataloader: DataLoader, optimizer: torch.optim.Optimizer, device: torch.device, scheduler: NoamScheduler | None, grad_clip: float, log_every: int, global_step: int, run: Any | None = None) -> dict[str, float]:
     model.train()
     total_loss = 0.0
     recent_loss = 0.0
     recent_steps = 0
     last_lr = optimizer.param_groups[0]["lr"]
-    for step, batch in enumerate(dataloader, start=1):
+    for batch in dataloader:
+        global_step += 1
         batch = move_batch_to_device(batch, device)
         optimizer.zero_grad(set_to_none=True)
         logits = model(batch["src_input_ids"], batch["tgt_input_ids"], batch["src_key_padding_mask"], batch["tgt_key_padding_mask"])
@@ -311,14 +312,14 @@ def train_one_epoch(model: TransformerSeq2Seq, dataloader: DataLoader, optimizer
         total_loss += loss_value
         recent_loss += loss_value
         recent_steps += 1
-        if log_every > 0 and step % log_every == 0:
+        if log_every > 0 and global_step % log_every == 0:
             recent_avg_loss = recent_loss / max(1, recent_steps)
-            print(f"step={step} train_loss_avg_last_{recent_steps}_steps={recent_avg_loss:.4f} lr={last_lr:.6g}")
-            log_swanlab(run, {"train/loss_avg_recent": recent_avg_loss, "train/lr": last_lr, "train/step": float(step)})
+            print(f"step={global_step} train_loss={recent_avg_loss:.4f} lr={last_lr:.6g}")
+            log_swanlab(run, {"train/loss": recent_avg_loss, "train/lr": last_lr}, step=global_step)
             recent_loss = 0.0
             recent_steps = 0
     avg_loss = total_loss / max(1, len(dataloader))
-    return {"loss": avg_loss, "ppl": math.exp(min(avg_loss, 20.0)), "lr": last_lr}
+    return {"loss": avg_loss, "ppl": math.exp(min(avg_loss, 20.0)), "lr": last_lr, "global_step": float(global_step)}
 
 
 @torch.no_grad()
@@ -504,15 +505,17 @@ def main() -> None:
     history: list[dict[str, float]] = []
     best_eval_loss = float("inf")
     total_epochs = int(args.num_train_epochs)
+    global_step = max(0, start_epoch - 1) * len(train_loader)
     for epoch in range(start_epoch, total_epochs + 1):
         print(f"Epoch {epoch}/{total_epochs}")
-        train_metrics = train_one_epoch(model, train_loader, optimizer, device, scheduler, args.grad_clip, args.logging_steps, run=run)
+        train_metrics = train_one_epoch(model, train_loader, optimizer, device, scheduler, args.grad_clip, args.logging_steps, global_step, run=run)
+        global_step = int(train_metrics["global_step"])
         if args.do_eval:
             print(f"Running validation after epoch {epoch} on the full eval split.")
             eval_metrics = evaluate_loss(model, eval_loader, device, run=run, epoch=epoch)
         else:
             eval_metrics = {"loss": 0.0, "ppl": 0.0}
-        metrics = {"epoch": float(epoch), "train_loss": train_metrics["loss"], "train_ppl": train_metrics["ppl"], "eval_loss": eval_metrics["loss"], "eval_ppl": eval_metrics["ppl"]}
+        metrics = {"epoch": float(epoch), "global_step": float(global_step), "train_loss": train_metrics["loss"], "train_ppl": train_metrics["ppl"], "eval_loss": eval_metrics["loss"], "eval_ppl": eval_metrics["ppl"]}
         print(json.dumps(metrics, ensure_ascii=False, indent=2))
         log_swanlab(run, {"train/epoch_loss": train_metrics["loss"], "train/epoch_ppl": train_metrics["ppl"], "eval/epoch_loss": eval_metrics["loss"], "eval/epoch_ppl": eval_metrics["ppl"]}, step=epoch)
         history.append(metrics)
